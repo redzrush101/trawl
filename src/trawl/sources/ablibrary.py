@@ -49,8 +49,6 @@ class PageContent:
 class SearchResult:
     books: list[Book]
     total_results: int
-    total_books: int
-    duration_ms: int
     page: int
     per_page: int
     has_more: bool
@@ -62,6 +60,19 @@ class TocItem:
     page_number: int
     level: int
     children: list = field(default_factory=list)
+
+
+def _parse_pagination(data: dict, page: int, per_page: int) -> dict:
+    pagination = data.get("pagination", {})
+    total = pagination.get("totalItems", 0) or 0
+    total_pages = pagination.get("totalPages", 1) or 1
+    current = pagination.get("currentPage", page) or page
+    return {
+        "total_results": total,
+        "page": current,
+        "per_page": pagination.get("perPage", per_page),
+        "has_more": current < total_pages,
+    }
 
 
 def _book_from_json(d: dict) -> Book:
@@ -159,19 +170,7 @@ class Client:
 
         data = self._request("List", body)
         books = [_book_from_json(b) for b in data.get("books", [])]
-        pagination = data.get("pagination", {})
-        total_results = pagination.get("totalItems", 0) or 0
-        total_pages = pagination.get("totalPages", 1) or 1
-        current_page = pagination.get("currentPage", page) or page
-        return SearchResult(
-            books=books,
-            total_results=total_results,
-            total_books=total_results,
-            duration_ms=0,
-            page=current_page,
-            per_page=pagination.get("perPage", per_page),
-            has_more=current_page < total_pages,
-        )
+        return SearchResult(books=books, **_parse_pagination(data, page, per_page))
 
     def details(self, book_id: str) -> Book:
         data = self._request("Details", {"id": book_id})
@@ -221,19 +220,7 @@ class Client:
         }
         data = self._request("List", body)
         books = [_book_from_json(b) for b in data.get("books", [])]
-        pagination = data.get("pagination", {})
-        total_results = pagination.get("totalItems", 0) or 0
-        total_pages = pagination.get("totalPages", 1) or 1
-        current_page = pagination.get("currentPage", page) or page
-        return SearchResult(
-            books=books,
-            total_results=total_results,
-            total_books=total_results,
-            duration_ms=0,
-            page=current_page,
-            per_page=pagination.get("perPage", per_page),
-            has_more=current_page < total_pages,
-        )
+        return SearchResult(books=books, **_parse_pagination(data, page, per_page))
 
     def search_in_text(self, book_id: str, query: str, max_pages: int = 500) -> list[PageContent]:
         matching = []
@@ -265,7 +252,7 @@ def search_result_to_markdown(result: SearchResult, query: str = "") -> str:
     else:
         lines.append("# Search Results")
     lines.append("")
-    lines.append(f"Found **{result.total_results}** matches in **{result.total_books}** books ({result.duration_ms}ms)")
+    lines.append(f"Found **{result.total_results}** matches")
     lines.append("")
     for book in result.books:
         lines.append(f"## [{book.id}] {book.title}")

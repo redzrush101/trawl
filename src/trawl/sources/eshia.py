@@ -13,6 +13,26 @@ from ..output import print_json
 BASE_URL = "https://lib.eshia.ir"
 AR_BASE_URL = "https://ar.lib.eshia.ir"
 
+# CSS selectors and constants
+BOOK_TITLE_CLASS = "book_title_heading"
+BOOK_AUTHOR_CLASS = "book_author_heading"
+VOLUME_SELECTOR_CLASS = "VolumeSelector"
+PAGE_SELECTOR_CLASS = "PageSelector"
+CONTENT_CLASS = "book-page-show"
+COVER_IMG_CLASS = "libimages"
+FEHREST_TABLE_CLASS = "fehresttable"
+FEHREST_ROW_CLASS = "fehrest1"
+SEARCH_RESULT_ID = "search-result"
+BOOKS_LIST_ID = "BooksList"
+AUTHOR_BOOKS_LIST_ID = "AuthorBooksList"
+AUTHORS_LIST_ID = "AuthorsList"
+
+UI_KILL_CLASSES = ("tools", "sticky-menue", "trans1", "toolbox", "quick-tools")
+
+# Persian labels
+LAST_PAGE_TITLE = "نمایش صفحه‌آخر"
+META_KEYS = ("ناشر:", "محل نشر:", "سال نشر:", "زبان:", "موضوع:")
+
 
 @dataclass
 class Book:
@@ -175,9 +195,6 @@ class Client:
                         return val
         return None
 
-    def fetch_page_raw(self, book_id: int, volume: int, page: int) -> str:
-        return self._get(f"/{book_id}/{volume}/{page}")
-
     def download_image(self, img_url: str, save_path: Path):
         headers = {"Referer": self.base}
         resp = self._http.get(img_url, headers=headers)
@@ -194,6 +211,46 @@ class Client:
         self.close()
 
 
+def _normalize_url(src: str) -> str:
+    if src.startswith("//"):
+        return "https:" + src
+    if not src.startswith("http"):
+        return BASE_URL + "/" + src.lstrip("/")
+    return src
+
+
+def _extract_title(soup: BeautifulSoup) -> str:
+    title_el = soup.find("h1", class_=BOOK_TITLE_CLASS) or soup.find("h1", class_="") or soup.find("h1")
+    if title_el:
+        raw = title_el.get_text(" ", strip=True)
+        return re.sub(r'\s*جلد\s*:\s*\d+\s*صفحه\s*:\s*\d+', '', raw).strip()
+    return ""
+
+
+def _extract_author(soup: BeautifulSoup) -> tuple[str, str]:
+    author_el = soup.find("h2", class_=BOOK_AUTHOR_CLASS)
+    if author_el:
+        a = author_el.find("a")
+        if a:
+            return a.get_text(strip=True), a.get("href", "")
+    author_p = soup.find("p", id="author")
+    if author_p:
+        return author_p.get_text(strip=True), ""
+    return "", ""
+
+
+def _extract_total_pages(soup: BeautifulSoup) -> int:
+    last_link = soup.find("a", title=LAST_PAGE_TITLE)
+    if last_link:
+        href = last_link.get("href", "")
+        parts = href.rstrip("/").split("/")
+        try:
+            return int(parts[-1])
+        except (ValueError, IndexError):
+            pass
+    return 0
+
+
 def _quote(query: str) -> str:
     return quote(query.replace(" ", "_"), safe="")
 
@@ -208,7 +265,7 @@ def _extract_book_id(href: str) -> int | None:
 def _parse_books_from_category(html: str) -> list[Book]:
     soup = BeautifulSoup(html, "html.parser")
     books: list[Book] = []
-    table = soup.find("table", id="BooksList") or soup.find("table", id="AuthorBooksList")
+    table = soup.find("table", id=BOOKS_LIST_ID) or soup.find("table", id=AUTHOR_BOOKS_LIST_ID)
     if not table:
         return books
     tbody = table.find("tbody")
@@ -243,64 +300,30 @@ def _parse_books_from_category(html: str) -> list[Book]:
 
 def _parse_book_detail(html: str, book_id: int) -> BookDetail | None:
     soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.find("h1", class_="book_title_heading") or soup.find("h1", class_="") or soup.find("h1")
-    title = ""
-    if title_el:
-        raw = title_el.get_text(" ", strip=True)
-        raw = re.sub(r'\s*جلد\s*:\s*\d+\s*صفحه\s*:\s*\d+', '', raw)
-        title = raw.strip()
-
-    author_el = soup.find("h2", class_="book_author_heading")
-    author = ""
-    author_url = ""
-    if author_el:
-        a = author_el.find("a")
-        if a:
-            author = a.get_text(strip=True)
-            author_url = a.get("href", "")
-    else:
-        author_p = soup.find("p", id="author")
-        if author_p:
-            author = author_p.get_text(strip=True)
+    title = _extract_title(soup)
+    author, author_url = _extract_author(soup)
+    total_pages = _extract_total_pages(soup)
 
     vol = 1
-    total_pages = 0
     total_volumes = 1
 
-    vol_select = soup.find("select", class_="VolumeSelector")
+    vol_select = soup.find("select", class_=VOLUME_SELECTOR_CLASS)
     if vol_select:
         options = vol_select.find_all("option")
         total_volumes = len(options)
 
-    last_link = soup.find("a", title="نمایش صفحه‌آخر")
-    if last_link:
-        href = last_link.get("href", "")
-        parts = href.rstrip("/").split("/")
-        try:
-            total_pages = int(parts[-1])
-        except (ValueError, IndexError):
-            pass
-
-    content_div = soup.find("td", class_="book-page-show")
+    content_div = soup.find("td", class_=CONTENT_CLASS)
     metadata: dict[str, str] = {}
     if content_div:
         for p in content_div.find_all("p"):
             text = p.get_text(" ", strip=True)
-            for key in ("ناشر:", "محل نشر:", "سال نشر:", "زبان:", "موضوع:"):
+            for key in META_KEYS:
                 if key in text:
                     val = text.split(key, 1)[-1].strip()
                     metadata[key] = val
 
-    cover_img = soup.find("img", class_="libimages")
-    cover_url = ""
-    if cover_img:
-        src = cover_img.get("src", "")
-        if src:
-            if src.startswith("//"):
-                src = "https:" + src
-            elif not src.startswith("http"):
-                src = BASE_URL + "/" + src.lstrip("/")
-            cover_url = src
+    cover_img = soup.find("img", class_=COVER_IMG_CLASS)
+    cover_url = _normalize_url(cover_img.get("src", "")) if cover_img and cover_img.get("src") else ""
 
     return BookDetail(
         id=book_id,
@@ -310,11 +333,11 @@ def _parse_book_detail(html: str, book_id: int) -> BookDetail | None:
         volume=vol,
         total_pages=total_pages,
         total_volumes=total_volumes,
-        publisher=metadata.get("ناشر:", ""),
-        publisher_location=metadata.get("محل نشر:", ""),
-        year=metadata.get("سال نشر:", ""),
-        language=metadata.get("زبان:", ""),
-        subject=metadata.get("موضوع:", ""),
+        publisher=metadata.get(META_KEYS[0], ""),
+        publisher_location=metadata.get(META_KEYS[1], ""),
+        year=metadata.get(META_KEYS[2], ""),
+        language=metadata.get(META_KEYS[3], ""),
+        subject=metadata.get(META_KEYS[4], ""),
         cover_url=cover_url,
     )
 
@@ -322,14 +345,14 @@ def _parse_book_detail(html: str, book_id: int) -> BookDetail | None:
 def _parse_toc(html: str) -> list[TocEntry]:
     soup = BeautifulSoup(html, "html.parser")
     entries: list[TocEntry] = []
-    table = soup.find("table", class_="fehresttable")
+    table = soup.find("table", class_=FEHREST_TABLE_CLASS)
     if not table:
         return entries
     for row in table.find_all("tr"):
         tds = row.find_all("td")
         if len(tds) < 1:
             continue
-        title_div = tds[0].find("div", class_="fehrest1")
+        title_div = tds[0].find("div", class_=FEHREST_ROW_CLASS)
         if not title_div:
             continue
         link = title_div.find("a")
@@ -350,7 +373,7 @@ def _parse_search_results(html: str) -> tuple[list[SearchResult], int, int]:
     soup = BeautifulSoup(html, "html.parser")
     results: list[SearchResult] = []
 
-    result_table = soup.find("table", id="search-result")
+    result_table = soup.find("table", id=SEARCH_RESULT_ID)
     if not result_table:
         return results, 0, 0
 
@@ -433,25 +456,14 @@ def _parse_search_results(html: str) -> tuple[list[SearchResult], int, int]:
 
 def _parse_page_content(html: str, book_id: int) -> PageContent | None:
     soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.find("h1", class_="book_title_heading")
-    book_title = ""
-    if title_el:
-        raw = title_el.get_text(" ", strip=True)
-        raw = re.sub(r'\s*جلد\s*:\s*\d+\s*صفحه\s*:\s*\d+', '', raw)
-        book_title = raw.strip()
-
-    author_el = soup.find("h2", class_="book_author_heading")
-    author = ""
-    if author_el:
-        a = author_el.find("a")
-        if a:
-            author = a.get_text(strip=True)
+    book_title = _extract_title(soup)
+    author, _ = _extract_author(soup)
+    total_pages = _extract_total_pages(soup)
 
     vol = 1
     page = 0
-    total_pages = 0
 
-    vol_select = soup.find("select", class_="VolumeSelector")
+    vol_select = soup.find("select", class_=VOLUME_SELECTOR_CLASS)
     if vol_select:
         selected = vol_select.find("option", selected=True)
         if selected:
@@ -460,39 +472,26 @@ def _parse_page_content(html: str, book_id: int) -> PageContent | None:
             except (ValueError, TypeError):
                 pass
 
-    page_input = soup.find("input", class_="PageSelector")
+    page_input = soup.find("input", class_=PAGE_SELECTOR_CLASS)
     if page_input:
         try:
             page = int(page_input.get("value", 0))
         except ValueError:
             pass
 
-    last_link = soup.find("a", title="نمایش صفحه‌آخر")
-    if last_link:
-        href = last_link.get("href", "")
-        parts = href.rstrip("/").split("/")
-        try:
-            total_pages = int(parts[-1])
-        except (ValueError, IndexError):
-            pass
-
-    content_div = soup.find("td", class_="book-page-show")
+    content_div = soup.find("td", class_=CONTENT_CLASS)
     inner_html = ""
     images: list[str] = []
     text = ""
     if content_div:
         inner_html = str(content_div)
-        for ui_class in ('tools', 'sticky-menue', 'trans1', 'toolbox', 'quick-tools'):
+        for ui_class in UI_KILL_CLASSES:
             for el in content_div.find_all(class_=ui_class):
                 el.decompose()
         for img in content_div.find_all("img"):
             src = img.get("src", "")
             if src:
-                if src.startswith("//"):
-                    src = "https:" + src
-                elif not src.startswith("http"):
-                    src = BASE_URL + "/" + src.lstrip("/")
-                images.append(src)
+                images.append(_normalize_url(src))
         text = content_div.get_text("\n", strip=True)
 
     return PageContent(
@@ -511,7 +510,7 @@ def _parse_page_content(html: str, book_id: int) -> PageContent | None:
 def _parse_authors(html: str) -> list[Author]:
     soup = BeautifulSoup(html, "html.parser")
     authors: list[Author] = []
-    table = soup.find("table", id="AuthorsList")
+    table = soup.find("table", id=AUTHORS_LIST_ID)
     if not table:
         return authors
     tbody = table.find("tbody")
@@ -561,11 +560,6 @@ def _parse_category_names(html: str) -> list[dict[str, str]]:
                 if href and name and "javascript" not in href:
                     categories.append({"name": name, "url": href})
     return categories
-
-
-def _clean_html(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text("\n", strip=True)
 
 
 def _render_page(content: PageContent) -> str:
@@ -706,4 +700,25 @@ def format_autocomplete(items: list[dict], json_mode: bool = False):
         lines = ["# Autocomplete Suggestions", ""]
         for item in items:
             lines.append(f"- {item['text']}")
+        print("\n".join(lines))
+
+
+def format_category_books(name: str, subcats: list[dict], books: list[Book], json_mode: bool = False):
+    if json_mode:
+        print_json({
+            "category": name,
+            "subcategories": subcats,
+            "books": [b.__dict__ for b in books],
+        })
+    else:
+        lines = [f"# Category: {name}", ""]
+        related = [s for s in subcats if name in s["name"] or s["name"] in name]
+        if related:
+            lines.append("**Subcategories:**")
+            for s in related:
+                lines.append(f"- {s['name']}")
+            lines.append("")
+        lines.append("**Books:**")
+        for b in books:
+            lines.append(f"- [{b.id}] {b.title} by {b.author} ({b.volumes} vol)")
         print("\n".join(lines))
