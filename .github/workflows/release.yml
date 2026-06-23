@@ -1,0 +1,98 @@
+name: Build binaries
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install ruff
+      - run: ruff check .
+
+  build:
+    needs: [lint]
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+
+      - name: Install UPX (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          curl -sL https://github.com/upx/upx/releases/download/v5.2.0/upx-5.2.0-win64.zip -o upx.zip
+          tar -xf upx.zip
+          echo "$PWD/upx-5.2.0-win64" >> "$GITHUB_PATH"
+
+      - name: Build binary with PyInstaller
+        run: |
+          echo "from trawl.cli import cli; cli()" > entry.py
+          pyinstaller --onefile --strip --name trawl entry.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: trawl-${{ runner.os }}
+          path: dist/trawl${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  release:
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get commit message
+        id: commit
+        run: |
+          echo "message=$(git log --format=%s -1)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Collect binaries
+        run: |
+          mkdir -p release
+          cp artifacts/trawl-Linux/trawl release/
+          cp artifacts/trawl-Windows/trawl.exe release/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: build-${{ steps.commit.outputs.sha }}
+          name: "${{ steps.commit.outputs.message }} (${{ steps.commit.outputs.sha }})"
+          body: "Automated build of [${{ steps.commit.outputs.sha }}](https://github.com/${{ github.repository }}/commit/${{ steps.commit.outputs.sha }})"
+          files: release/*
+          fail_on_unmatched_files: false
+          make_latest: true

@@ -1,0 +1,28 @@
+[project]
+name = "trawl"
+version = "0.1.0"
+description = "Unified CLI scraper for Islamic digital libraries"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.4.1",
+    "httpx>=0.28.1",
+    "beautifulsoup4>=4.15.0",
+]
+scripts = { trawl = "trawl.cli:cli" }
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "N"]
+
+[tool.ruff.format]
+quote-style = "double"
