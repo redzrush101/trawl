@@ -38,12 +38,29 @@ class Cache:
     def __init__(self, enabled: bool = True, ttl: float = 3600.0):
         self.enabled = enabled
         self.default_ttl = ttl
+        self._conn: sqlite3.Connection | None = None
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = _ensure_db()
+        return self._conn
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def get(self, url: str, params: dict | None = None) -> bytes | None:
         if not self.enabled:
             return None
         try:
-            conn = _ensure_db()
+            conn = self._connect()
             key = _make_key(url, params)
             row = conn.execute(
                 "SELECT value, created_at, ttl FROM cache WHERE key = ?", (key,)
@@ -62,7 +79,7 @@ class Cache:
         if not self.enabled:
             return
         try:
-            conn = _ensure_db()
+            conn = self._connect()
             key = _make_key(url, params)
             conn.execute(
                 "INSERT OR REPLACE INTO cache (key, value, created_at, ttl) VALUES (?, ?, ?, ?)",
@@ -74,17 +91,10 @@ class Cache:
 
     def clear(self):
         try:
-            conn = _ensure_db()
+            conn = self._connect()
             conn.execute("DELETE FROM cache")
             conn.commit()
         except Exception:
             pass
 
-    def invalidate(self, url_pattern: str):
-        try:
-            conn = _ensure_db()
-            key_prefix = hashlib.sha256(url_pattern.encode()).hexdigest()[:16]
-            conn.execute("DELETE FROM cache WHERE key LIKE ?", (f"{key_prefix}%",))
-            conn.commit()
-        except Exception:
-            pass
+

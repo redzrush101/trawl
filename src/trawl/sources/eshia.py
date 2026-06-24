@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as j
 import re
 import time
 from dataclasses import dataclass, field
@@ -9,8 +10,6 @@ from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
-
-from ..output import print_json
 
 BASE_URL = "https://lib.eshia.ir"
 AR_BASE_URL = "https://ar.lib.eshia.ir"
@@ -251,51 +250,6 @@ class Client:
                         return val
         return None
 
-    def search_in_text(
-        self, book_id: int, query: str, volume: int = 1, max_pages: int = 500,
-        workers: int = 5, regex: bool = False,
-    ) -> list[PageContent]:
-        detail = self.book_detail(book_id)
-        total = detail.total_pages if detail else max_pages
-        total = min(total, max_pages)
-        matching = []
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        client_cfg = {
-            "arabic": self.arabic,
-            "verbose": self.verbose,
-            "user_agent": self._http.headers.get("User-Agent") if hasattr(self._http, "headers") else None,
-            "cache": self._cache is not None,
-        }
-
-        def _check_page(pn):
-            local = Client(**client_cfg)
-            try:
-                content = local.read_page(book_id, volume, pn, extract_images=False)
-                if content and content.text:
-                    if regex:
-                        if re.search(query, content.text):
-                            return content
-                    else:
-                        if query in content.text:
-                            return content
-            except Exception:
-                pass
-            finally:
-                local.close()
-            return None
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_check_page, pn): pn for pn in range(1, total + 1)}
-            for f in as_completed(futures):
-                r = f.result()
-                if r is not None:
-                    matching.append(r)
-
-        matching.sort(key=lambda x: x.page)
-        return matching
-
     def download_image(self, img_url: str, save_path: Path):
         headers = {"Referer": self.base}
         resp = self._http.get(img_url, headers=headers)
@@ -470,81 +424,7 @@ def _parse_toc(html: str) -> list[TocEntry]:
     return entries
 
 
-def _parse_search_results_fast(html: str) -> tuple[list[SearchResult], int, int]:
-    """Faster regex-based search results parser (skips full BS4 tree)."""
-    results: list[SearchResult] = []
-    current_page = 1
-    total_results = 0
-
-    m_total = re.search(r'class="result_count"[^>]*>([\d,]+)', html)
-    if m_total:
-        try:
-            total_results = int(m_total.group(1).replace(",", ""))
-        except ValueError:
-            pass
-
-    m_page = re.search(r'class="current-page"[^>]*>(\d+)', html)
-    if m_page:
-        try:
-            current_page = int(m_page.group(1))
-        except ValueError:
-            pass
-
-    row_pattern = (
-        r'<tr>.*?<td\s+class="data">.*?'
-        r'<a\s+href="[^"]*?/(\d+)(?:/(\d+))?(?:/(\d+))?[^"]*"[^>]*>'
-        r'(.*?)</a>.*?'
-        r'<div\s+class="preview">(.*?)</div>'
-        r'.*?</tr>'
-    )
-    for m in re.finditer(row_pattern, html, re.DOTALL):
-        bkid_str = m.group(1)
-        vol_str = m.group(2)
-        page_str = m.group(3)
-        link_html = m.group(4)
-        snippet_html = m.group(5) or ""
-
-        link_text = re.sub(r'<[^>]+>', '', link_html).strip()
-        snippet = re.sub(r'<[^>]+>', '', snippet_html).strip()
-        snippet = re.sub(r'\s+', ' ', snippet)
-
-        bkid = int(bkid_str) if bkid_str else 0
-        volume = int(vol_str) if vol_str else 0
-        page = int(page_str) if page_str else 0
-
-        if not bkid:
-            continue
-
-        clean = re.sub(r'[،,]\s*نام\s+کتاب\s*:', '', link_text)
-        clean = re.sub(r'نام\s+کتاب\s*:', '', clean)
-        clean = re.sub(r'[،,]\s*جلد\s*:', '', clean)
-        clean = re.sub(r'[،,]\s*صفحه\s*:', '', clean)
-        clean = clean.strip().strip('،').strip(',').strip()
-        author = ""
-        ma = re.search(r'\(([^)]+)\)\s*$', clean)
-        if ma:
-            author = ma.group(1)
-            clean = clean[:ma.start()].strip()
-
-        results.append(SearchResult(
-            book_id=bkid,
-            book_title=clean,
-            author=author,
-            volume=volume,
-            page=page,
-            snippet=snippet,
-            url=f"/{bkid}/{volume}/{page}" if volume else f"/{bkid}",
-        ))
-
-    return results, current_page, total_results
-
-
 def _parse_search_results(html: str) -> tuple[list[SearchResult], int, int]:
-    try:
-        return _parse_search_results_fast(html)
-    except Exception:
-        pass
-
     soup = BeautifulSoup(html, "html.parser")
     results: list[SearchResult] = []
 
@@ -665,34 +545,37 @@ def _parse_page_content(
     footnotes = ""
     if content_div:
         inner_html = str(content_div)
+
+        # Work on a copy to avoid mutating the original tree
+        text_soup = BeautifulSoup(inner_html, "html.parser")
         for ui_class in UI_KILL_CLASSES:
-            for el in content_div.find_all(class_=ui_class):
-                el.decompose()
-        # Strip other boilerplate inside content
-        for tag in content_div.find_all(["script", "style", "noscript"]):
-            tag.decompose()
-        # Split on <hr/> for footnotes
-        hr = content_div.find("hr")
+            for el in text_soup.find_all(class_=ui_class):
+                el.extract()
+        for tag in text_soup.find_all(["script", "style", "noscript"]):
+            tag.extract()
+        if not keep_chains:
+            for span in text_soup.find_all("span", class_="KalamateKhas3"):
+                span.extract()
+
+        # Extract footnotes after <hr/>
+        hr = text_soup.find("hr")
         if hr:
             fn_parts = []
             for sib in list(hr.find_next_siblings()):
                 t = sib.get_text("\n", strip=True)
                 if t:
                     fn_parts.append(t)
-                sib.decompose()
-            hr.decompose()
+            hr.extract()
             if fn_parts:
                 footnotes = _unescape("\n".join(fn_parts))
-        # Strip hadith chains if requested
-        if not keep_chains:
-            for span in content_div.find_all("span", class_="KalamateKhas3"):
-                span.decompose()
+
         if extract_images:
-            for img in content_div.find_all("img"):
+            for img in soup.find_all("img"):
                 src = img.get("src", "")
                 if src:
                     images.append(_normalize_url(src))
-        text = _unescape(content_div.get_text("\n", strip=True))
+
+        text = _unescape(text_soup.get_text("\n", strip=True))
 
     return PageContent(
         book_id=book_id,
@@ -811,27 +694,27 @@ def search_results_to_text(results: list[SearchResult], current_page: int, total
     return "\n".join(lines)
 
 
+def _format_output(obj, to_text, json_mode: bool = False):
+    if json_mode:
+        print(j.dumps(obj, indent=2, default=str, ensure_ascii=False))
+    else:
+        print(to_text())
+
+
 def format_search_results(
     results: list[SearchResult], current_page: int, total: int,
     query: str = "", json_mode: bool = False,
 ):
-    if json_mode:
-        print_json({
-            "results": [r.__dict__ for r in results],
-            "total": total,
-            "page": current_page,
-            "query": query,
-        })
-    else:
-        print(search_results_to_text(results, current_page, total, query))
+    _format_output(
+        {"results": [r.__dict__ for r in results], "total": total, "page": current_page, "query": query},
+        lambda: search_results_to_text(results, current_page, total, query),
+        json_mode,
+    )
 
 
 def format_book_detail(detail: BookDetail | None, json_mode: bool = False):
     if json_mode:
-        if detail:
-            print_json(detail.__dict__)
-        else:
-            print_json({"error": "Book not found"})
+        _format_output(detail.__dict__ if detail else {"error": "Book not found"}, lambda: "", json_mode)
     else:
         if not detail:
             print("Book not found")
@@ -860,10 +743,7 @@ def format_book_detail(detail: BookDetail | None, json_mode: bool = False):
 
 def format_page_content(content: PageContent | None, json_mode: bool = False, max_tokens: int | None = None):
     if json_mode:
-        if content:
-            print_json(content.__dict__)
-        else:
-            print_json({"error": "Page not found"})
+        _format_output(content.__dict__ if content else {"error": "Page not found"}, lambda: "", json_mode)
     else:
         if not content:
             print("Page not found")
@@ -872,54 +752,47 @@ def format_page_content(content: PageContent | None, json_mode: bool = False, ma
 
 
 def format_toc(entries: list[TocEntry], json_mode: bool = False):
-    if json_mode:
-        print_json([e.__dict__ for e in entries])
-    else:
-        lines = ["# Table of Contents", ""]
-        for e in entries:
-            page_str = f" (p. {e.page})" if e.page else ""
-            indent = "  " * e.depth
-            lines.append(f"{indent}- {e.title}{page_str}")
-        print("\n".join(lines))
+    _format_output(
+        [e.__dict__ for e in entries],
+        lambda: "\n".join(
+            ["# Table of Contents", ""]
+            + [f"{'  ' * e.depth}- {e.title}{' (p. ' + str(e.page) + ')' if e.page else ''}" for e in entries]
+        ),
+        json_mode,
+    )
 
 
 def format_categories(categories: list[dict[str, str]], json_mode: bool = False):
-    if json_mode:
-        print_json(categories)
-    else:
-        lines = ["# Categories", ""]
-        for c in categories:
-            lines.append(f"- {c['name']}")
-        print("\n".join(lines))
+    _format_output(
+        categories,
+        lambda: "\n".join(["# Categories", ""] + [f"- {c['name']}" for c in categories]),
+        json_mode,
+    )
 
 
 def format_authors(authors: list[Author], json_mode: bool = False):
-    if json_mode:
-        print_json([a.__dict__ for a in authors])
-    else:
-        lines = ["# Authors", ""]
-        for a in authors:
-            lines.append(f"- {a.name} ({a.book_count} books)")
-        print("\n".join(lines))
+    _format_output(
+        [a.__dict__ for a in authors],
+        lambda: "\n".join(["# Authors", ""] + [f"- {a.name} ({a.book_count} books)" for a in authors]),
+        json_mode,
+    )
 
 
 def format_autocomplete(items: list[dict], json_mode: bool = False):
-    if json_mode:
-        print_json(items)
-    else:
-        lines = ["# Autocomplete Suggestions", ""]
-        for item in items:
-            lines.append(f"- {item['text']}")
-        print("\n".join(lines))
+    _format_output(
+        items,
+        lambda: "\n".join(["# Autocomplete Suggestions", ""] + [f"- {item['text']}" for item in items]),
+        json_mode,
+    )
 
 
 def format_category_books(name: str, subcats: list[dict], books: list[Book], json_mode: bool = False):
     if json_mode:
-        print_json({
-            "category": name,
-            "subcategories": subcats,
-            "books": [b.__dict__ for b in books],
-        })
+        _format_output(
+            {"category": name, "subcategories": subcats, "books": [b.__dict__ for b in books]},
+            lambda: "",
+            json_mode,
+        )
     else:
         lines = [f"# Category: {name}", ""]
         related = [s for s in subcats if name in s["name"] or s["name"] in name]

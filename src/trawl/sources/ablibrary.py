@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import json as j
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-
-from ..output import print_json
 
 BASE_URL = "https://ablibrary.net"
 
@@ -144,7 +143,6 @@ class Client:
         elif not cache:
             _cache = None
         self._cache = _cache
-        self._search_cache: dict = {}
 
         headers = {
             "Content-Type": "application/json",
@@ -172,7 +170,6 @@ class Client:
             cached = self._cache.get(url, params)
             if cached is not None:
                 self._log(f"CACHE HIT {path}")
-                import json as j
                 return j.loads(cached.decode("utf-8"))
 
         self._log(f"{http_method} {path}")
@@ -195,7 +192,6 @@ class Client:
                 data = resp.json()
 
                 if self._cache and http_method == "GET":
-                    import json as j
                     self._cache.set(url, j.dumps(data, ensure_ascii=False).encode("utf-8"), params)
 
                 return data
@@ -250,17 +246,12 @@ class Client:
         return self._request("GET", f"/search/{task_id}", params={"offset": offset, "limit": limit})
 
     def _ensure_search_task(self, query: str, book_ids: list[int] | None = None):
-        cache_key = ("search", query, tuple(book_ids or []))
-        if cache_key in self._search_cache:
-            return self._search_cache[cache_key]
         task_id = self._create_search_task(query, book_ids=book_ids)
         self._poll_task(task_id)
         raw = self._get_raw_search_results(task_id)
         all_entries = raw.get("books", [])
         total_matching = raw.get("total_books_count", 0)
-        result = (task_id, all_entries, total_matching)
-        self._search_cache[cache_key] = result
-        return result
+        return (task_id, all_entries, total_matching)
 
     def search(
         self,
@@ -271,12 +262,9 @@ class Client:
         publisher: str = "",
         languages: list[str] | None = None,
         categories: list[str] | None = None,
-        sources: list[str] | None = None,
         has_pdf: bool | None = None,
         page: int = 1,
         per_page: int = 50,
-        sort_by: str = "",
-        sort_dir: str = "",
     ) -> SearchResult:
         _, all_entries, total_books = self._ensure_search_task(query)
 
@@ -311,34 +299,6 @@ class Client:
             page=page,
             per_page=per_page,
             has_more=(offset + per_page) < total_books,
-        )
-
-    def search_all(
-        self,
-        query: str = "",
-        per_page: int = 50,
-        max_results: int = 500,
-        **filters,
-    ) -> SearchResult:
-        _, all_entries, total_books = self._ensure_search_task(query)
-        entries = all_entries[:max_results]
-
-        books: list[Book] = []
-        for entry in entries:
-            if len(books) >= max_results:
-                break
-            try:
-                book = self.details(str(entry["book_id"]))
-                books.append(book)
-            except Exception:
-                continue
-
-        return SearchResult(
-            books=books,
-            total_results=total_books,
-            page=1,
-            per_page=per_page,
-            has_more=False,
         )
 
     def details(self, book_id: str) -> Book:
@@ -413,24 +373,23 @@ class Client:
             has_more=(offset + per_page) < total_books,
         )
 
-    def search_in_text(self, book_id: str, query: str, max_pages: int = 500, workers: int = 5) -> list[PageContent]:
-        all_pages = self.contents(book_id)
-        matching = [p for p in all_pages if query in p.text]
-        if max_pages and len(matching) > max_pages:
-            matching = matching[:max_pages]
-        return matching
-
-    def search_in_text_regex(
-        self, book_id: str, pattern: str,
-        max_pages: int = 500, workers: int = 5,
+    def search_in_text(
+        self, book_id: str, query: str,
+        max_pages: int = 500, regex: bool = False,
     ) -> list[PageContent]:
-        try:
-            compiled = re.compile(pattern)
-        except re.error as e:
-            raise ValueError(f"Invalid regex: {e}")
+        if regex:
+            try:
+                compiled = re.compile(query)
+            except re.error as e:
+                raise ValueError(f"Invalid regex: {e}")
+            def predicate(p):
+                return bool(compiled.search(p.text))
+        else:
+            def predicate(p):
+                return query in p.text
 
         all_pages = self.contents(book_id)
-        matching = [p for p in all_pages if compiled.search(p.text)]
+        matching = [p for p in all_pages if predicate(p)]
         if max_pages and len(matching) > max_pages:
             matching = matching[:max_pages]
         return matching
@@ -526,34 +485,31 @@ def toc_to_markdown(items: list[TocItem], book_id: str) -> str:
     return "\n".join(lines)
 
 
-def format_search_result(result: SearchResult, query: str = "", json_mode: bool = False):
+def _format_output(obj, to_markdown, json_mode: bool = False):
     if json_mode:
-        print_json({
-            "books": [b.__dict__ for b in result.books],
-            "total_results": result.total_results,
-            "page": result.page,
-            "has_more": result.has_more,
-        })
+        print(j.dumps(obj, indent=2, default=str, ensure_ascii=False))
     else:
-        print(search_result_to_markdown(result, query))
+        print(to_markdown())
+
+
+def format_search_result(result: SearchResult, query: str = "", json_mode: bool = False):
+    _format_output(
+        {"books": [b.__dict__ for b in result.books],
+         "total_results": result.total_results,
+         "page": result.page,
+         "has_more": result.has_more},
+        lambda: search_result_to_markdown(result, query),
+        json_mode,
+    )
 
 
 def format_book(book: Book, json_mode: bool = False):
-    if json_mode:
-        print_json(book.__dict__)
-    else:
-        print(book_to_markdown(book))
+    _format_output(book.__dict__, lambda: book_to_markdown(book), json_mode)
 
 
 def format_page(page: PageContent, json_mode: bool = False):
-    if json_mode:
-        print_json(page.__dict__)
-    else:
-        print(page_to_markdown(page))
+    _format_output(page.__dict__, lambda: page_to_markdown(page), json_mode)
 
 
 def format_toc(items: list[TocItem], book_id: str, json_mode: bool = False):
-    if json_mode:
-        print_json([i.__dict__ for i in items])
-    else:
-        print(toc_to_markdown(items, book_id))
+    _format_output([i.__dict__ for i in items], lambda: toc_to_markdown(items, book_id), json_mode)
