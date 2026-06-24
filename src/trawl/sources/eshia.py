@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
+from html import unescape as _unescape
 from pathlib import Path
 from urllib.parse import quote
 
@@ -32,6 +34,9 @@ UI_KILL_CLASSES = ("tools", "sticky-menue", "trans1", "toolbox", "quick-tools")
 # Persian labels
 LAST_PAGE_TITLE = "نمایش صفحه‌آخر"
 META_KEYS = ("ناشر:", "محل نشر:", "سال نشر:", "زبان:", "موضوع:")
+
+# Cache instance (set by Client)
+_cache = None
 
 
 @dataclass
@@ -96,36 +101,80 @@ class PageContent:
     html: str
     images: list[str] = field(default_factory=list)
     text: str = ""
+    footnotes: str = ""
 
 
 class Client:
-    def __init__(self, arabic: bool = False, timeout: float = 30.0):
+    def __init__(
+        self,
+        arabic: bool = False,
+        timeout: float = 30.0,
+        verbose: bool = False,
+        user_agent: str | None = None,
+        proxy: str | None = None,
+        cache: bool = True,
+        cache_ttl: int = 3600,
+    ):
         self.arabic = arabic
         self.base = AR_BASE_URL if arabic else BASE_URL
-        self._http = httpx.Client(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
-            headers={
-                "User-Agent": "trawl/0.1",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-        )
+        self.verbose = verbose
+        global _cache
+        if cache and _cache is None:
+            from ..cache import Cache
+            _cache = Cache(enabled=True, ttl=cache_ttl)
+        elif not cache:
+            _cache = None
+        self._cache = _cache
+
+        headers = {
+            "User-Agent": user_agent or "trawl/0.1",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        client_kwargs = {
+            "timeout": httpx.Timeout(timeout),
+            "follow_redirects": True,
+            "headers": headers,
+        }
+        if proxy:
+            client_kwargs["proxies"] = proxy
+        self._http = httpx.Client(**client_kwargs)
 
     def _url(self, path: str) -> str:
         return f"{self.base}{path}"
 
+    def _log(self, msg: str):
+        if self.verbose:
+            print(f"[eshia] {msg}")
+
     def _get(self, path: str, params: dict | None = None) -> str:
-        import time
+        url = self._url(path)
+        cache_key = url
+        if self._cache:
+            cached = self._cache.get(cache_key, params)
+            if cached is not None:
+                self._log(f"CACHE HIT {path}")
+                return cached.decode("utf-8")
+
+        self._log(f"GET {path}")
+        t0 = time.time()
         for attempt in range(3):
-            resp = self._http.get(self._url(path), params=params)
-            if resp.status_code in (502, 503, 504) and attempt < 2:
-                time.sleep(0.5 * (2 ** attempt))
+            resp = self._http.get(url, params=params)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                delay = 0.5 * (2 ** attempt)
+                self._log(f"Retry {attempt + 1} after {delay}s (status {resp.status_code})")
+                time.sleep(delay)
                 continue
             resp.raise_for_status()
-            return resp.text
+            elapsed = time.time() - t0
+            self._log(f"  -> {resp.status_code} ({elapsed:.2f}s, {len(resp.content)} bytes)")
+            body = resp.text
+            if self._cache:
+                self._cache.set(cache_key, body.encode("utf-8"), params)
+            return body
 
     def _post_autocomplete(self, query: str) -> str:
         url = f"{BASE_URL}/ajax/search/1"
+        self._log("POST /ajax/search")
         resp = self._http.post(
             url,
             data={"query": query},
@@ -155,15 +204,22 @@ class Client:
         html = self._get(f"/{book_id}")
         return _parse_book_detail(html, book_id)
 
-    def read_page(self, book_id: int, volume: int, page: int) -> PageContent | None:
+    def read_page(
+        self, book_id: int, volume: int, page: int,
+        extract_images: bool = True, keep_chains: bool = True,
+    ) -> PageContent | None:
         html = self._get(f"/{book_id}/{volume}/{page}")
-        return _parse_page_content(html, book_id)
+        return _parse_page_content(html, book_id, extract_images=extract_images, keep_chains=keep_chains)
 
     def table_of_contents(self, book_id: int, volume: int = 1) -> list[TocEntry]:
         detail = self.book_detail(book_id)
         last_page = detail.total_pages if detail and detail.total_pages > 0 else 1
         html = self._get(f"/{book_id}/{volume}/{last_page}")
-        return _parse_toc(html)
+        entries = _parse_toc(html)
+        if not entries:
+            html2 = self._get(f"/{book_id}/{volume}/1")
+            entries = _parse_toc(html2)
+        return entries
 
     def category_books(self, category_path: str, page: int = 1) -> list[Book]:
         params = {"page": str(page)} if page > 1 else {}
@@ -194,6 +250,51 @@ class Client:
                     if val:
                         return val
         return None
+
+    def search_in_text(
+        self, book_id: int, query: str, volume: int = 1, max_pages: int = 500,
+        workers: int = 5, regex: bool = False,
+    ) -> list[PageContent]:
+        detail = self.book_detail(book_id)
+        total = detail.total_pages if detail else max_pages
+        total = min(total, max_pages)
+        matching = []
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        client_cfg = {
+            "arabic": self.arabic,
+            "verbose": self.verbose,
+            "user_agent": self._http.headers.get("User-Agent") if hasattr(self._http, "headers") else None,
+            "cache": self._cache is not None,
+        }
+
+        def _check_page(pn):
+            local = Client(**client_cfg)
+            try:
+                content = local.read_page(book_id, volume, pn, extract_images=False)
+                if content and content.text:
+                    if regex:
+                        if re.search(query, content.text):
+                            return content
+                    else:
+                        if query in content.text:
+                            return content
+            except Exception:
+                pass
+            finally:
+                local.close()
+            return None
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_check_page, pn): pn for pn in range(1, total + 1)}
+            for f in as_completed(futures):
+                r = f.result()
+                if r is not None:
+                    matching.append(r)
+
+        matching.sort(key=lambda x: x.page)
+        return matching
 
     def download_image(self, img_url: str, save_path: Path):
         headers = {"Referer": self.base}
@@ -369,7 +470,81 @@ def _parse_toc(html: str) -> list[TocEntry]:
     return entries
 
 
+def _parse_search_results_fast(html: str) -> tuple[list[SearchResult], int, int]:
+    """Faster regex-based search results parser (skips full BS4 tree)."""
+    results: list[SearchResult] = []
+    current_page = 1
+    total_results = 0
+
+    m_total = re.search(r'class="result_count"[^>]*>([\d,]+)', html)
+    if m_total:
+        try:
+            total_results = int(m_total.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    m_page = re.search(r'class="current-page"[^>]*>(\d+)', html)
+    if m_page:
+        try:
+            current_page = int(m_page.group(1))
+        except ValueError:
+            pass
+
+    row_pattern = (
+        r'<tr>.*?<td\s+class="data">.*?'
+        r'<a\s+href="[^"]*?/(\d+)(?:/(\d+))?(?:/(\d+))?[^"]*"[^>]*>'
+        r'(.*?)</a>.*?'
+        r'<div\s+class="preview">(.*?)</div>'
+        r'.*?</tr>'
+    )
+    for m in re.finditer(row_pattern, html, re.DOTALL):
+        bkid_str = m.group(1)
+        vol_str = m.group(2)
+        page_str = m.group(3)
+        link_html = m.group(4)
+        snippet_html = m.group(5) or ""
+
+        link_text = re.sub(r'<[^>]+>', '', link_html).strip()
+        snippet = re.sub(r'<[^>]+>', '', snippet_html).strip()
+        snippet = re.sub(r'\s+', ' ', snippet)
+
+        bkid = int(bkid_str) if bkid_str else 0
+        volume = int(vol_str) if vol_str else 0
+        page = int(page_str) if page_str else 0
+
+        if not bkid:
+            continue
+
+        clean = re.sub(r'[،,]\s*نام\s+کتاب\s*:', '', link_text)
+        clean = re.sub(r'نام\s+کتاب\s*:', '', clean)
+        clean = re.sub(r'[،,]\s*جلد\s*:', '', clean)
+        clean = re.sub(r'[،,]\s*صفحه\s*:', '', clean)
+        clean = clean.strip().strip('،').strip(',').strip()
+        author = ""
+        ma = re.search(r'\(([^)]+)\)\s*$', clean)
+        if ma:
+            author = ma.group(1)
+            clean = clean[:ma.start()].strip()
+
+        results.append(SearchResult(
+            book_id=bkid,
+            book_title=clean,
+            author=author,
+            volume=volume,
+            page=page,
+            snippet=snippet,
+            url=f"/{bkid}/{volume}/{page}" if volume else f"/{bkid}",
+        ))
+
+    return results, current_page, total_results
+
+
 def _parse_search_results(html: str) -> tuple[list[SearchResult], int, int]:
+    try:
+        return _parse_search_results_fast(html)
+    except Exception:
+        pass
+
     soup = BeautifulSoup(html, "html.parser")
     results: list[SearchResult] = []
 
@@ -454,7 +629,11 @@ def _parse_search_results(html: str) -> tuple[list[SearchResult], int, int]:
     return results, current_page, total_results
 
 
-def _parse_page_content(html: str, book_id: int) -> PageContent | None:
+def _parse_page_content(
+    html: str, book_id: int,
+    extract_images: bool = True,
+    keep_chains: bool = True,
+) -> PageContent | None:
     soup = BeautifulSoup(html, "html.parser")
     book_title = _extract_title(soup)
     author, _ = _extract_author(soup)
@@ -483,16 +662,37 @@ def _parse_page_content(html: str, book_id: int) -> PageContent | None:
     inner_html = ""
     images: list[str] = []
     text = ""
+    footnotes = ""
     if content_div:
         inner_html = str(content_div)
         for ui_class in UI_KILL_CLASSES:
             for el in content_div.find_all(class_=ui_class):
                 el.decompose()
-        for img in content_div.find_all("img"):
-            src = img.get("src", "")
-            if src:
-                images.append(_normalize_url(src))
-        text = content_div.get_text("\n", strip=True)
+        # Strip other boilerplate inside content
+        for tag in content_div.find_all(["script", "style", "noscript"]):
+            tag.decompose()
+        # Split on <hr/> for footnotes
+        hr = content_div.find("hr")
+        if hr:
+            fn_parts = []
+            for sib in list(hr.find_next_siblings()):
+                t = sib.get_text("\n", strip=True)
+                if t:
+                    fn_parts.append(t)
+                sib.decompose()
+            hr.decompose()
+            if fn_parts:
+                footnotes = _unescape("\n".join(fn_parts))
+        # Strip hadith chains if requested
+        if not keep_chains:
+            for span in content_div.find_all("span", class_="KalamateKhas3"):
+                span.decompose()
+        if extract_images:
+            for img in content_div.find_all("img"):
+                src = img.get("src", "")
+                if src:
+                    images.append(_normalize_url(src))
+        text = _unescape(content_div.get_text("\n", strip=True))
 
     return PageContent(
         book_id=book_id,
@@ -504,6 +704,7 @@ def _parse_page_content(html: str, book_id: int) -> PageContent | None:
         html=inner_html,
         images=images,
         text=text,
+        footnotes=footnotes,
     )
 
 
@@ -562,7 +763,7 @@ def _parse_category_names(html: str) -> list[dict[str, str]]:
     return categories
 
 
-def _render_page(content: PageContent) -> str:
+def _render_page(content: PageContent, max_tokens: int | None = None) -> str:
     lines = []
     lines.append(f"Book: {content.book_title}")
     lines.append(f"Author: {content.author}")
@@ -572,9 +773,18 @@ def _render_page(content: PageContent) -> str:
         for img in content.images:
             lines.append(f"  {img}")
     if content.text:
-        text = content.text[:2000]
+        text = content.text
+        if max_tokens:
+            words = text.split()
+            text = " ".join(words[:max_tokens])
+            if len(words) > max_tokens:
+                text += "\n..."
         lines.append("")
         lines.append(text)
+    if content.footnotes:
+        lines.append("")
+        lines.append("---")
+        lines.append(content.footnotes)
     return "\n".join(lines)
 
 
@@ -648,7 +858,7 @@ def format_book_detail(detail: BookDetail | None, json_mode: bool = False):
         print("\n".join(lines))
 
 
-def format_page_content(content: PageContent | None, json_mode: bool = False):
+def format_page_content(content: PageContent | None, json_mode: bool = False, max_tokens: int | None = None):
     if json_mode:
         if content:
             print_json(content.__dict__)
@@ -658,7 +868,7 @@ def format_page_content(content: PageContent | None, json_mode: bool = False):
         if not content:
             print("Page not found")
             return
-        print(_render_page(content))
+        print(_render_page(content, max_tokens=max_tokens))
 
 
 def format_toc(entries: list[TocEntry], json_mode: bool = False):
